@@ -22,7 +22,7 @@ func main() {
 	if err := setupCoraza(); err != nil {
 		panic(err)
 	}
-	http.Handle("/hello", corazaRequestHandler(http.HandlerFunc(hello)))
+	http.Handle("/", corazaRequestHandler(http.HandlerFunc(hello)))
 
 	fmt.Println("Server is running. Listening port: 8090")
 	panic(http.ListenAndServe(":8090", nil))
@@ -33,11 +33,15 @@ func setupCoraza() error {
 	waf.SetDebugLogLevel(9)
 	seclang := seclang.NewParser(waf)
 	if err := seclang.FromString(`
-		# This is a comment
+		SecDebugLogLevel 6
+		SecAuditEngine On
+		SecRuleEngine On
 		SecRequestBodyAccess On
-		SecRule ARGS:id "@eq 0" "id:1, phase:1,deny, status:403,msg:'Invalid id',log,auditlog"
-		SecRule REQUEST_BODY "somecontent" "id:100, phase:2,deny, status:403,msg:'Invalid request body',log,auditlog"
-		SecRule RESPONSE_BODY "somecontent" "id:200, phase:4,deny, status:403,msg:'Invalid response body',log,auditlog"
+		SecResponseBodyAccess On
+		SecRule REQUEST_URI "@rx /admin" "id:101,phase:1,t:lowercase,deny"
+		SecRule REQUEST_BODY "@rx maliciouspayload" "id:102,phase:2,t:lowercase,deny"
+		SecRule RESPONSE_HEADERS::status "@rx 406" "id:103,phase:3,t:lowercase,deny"
+		SecRule RESPONSE_BODY "@contains responsebodycode" "id:104,phase:4,t:lowercase,deny"
 	`); err != nil {
 		return err
 	}
