@@ -8,7 +8,8 @@ import (
 
 	"github.com/corazawaf/coraza/v3"
 	txhttp "github.com/corazawaf/coraza/v3/http"
-	"github.com/corazawaf/coraza/v3/types"
+	"github.com/corazawaf/coraza/v3/loggers"
+	ctypes "github.com/corazawaf/coraza/v3/types"
 )
 
 func hello(w http.ResponseWriter, req *http.Request) {
@@ -28,10 +29,13 @@ func main() {
 
 func setupCoraza() (coraza.WAF, error) {
 	waf, err := coraza.NewWAF(coraza.NewWAFConfig().
+		WithErrorLogger(logError).
+		WithDebugLogger(&debugLogger{}).
 		WithDirectives(`
 		# This is a comment
-		SecDebugLogLevel 9
+		SecDebugLogLevel 5
 		SecRequestBodyAccess On
+		SecResponseBodyAccess On
 		SecRule ARGS:id "@eq 0" "id:1, phase:1,deny, status:403,msg:'Invalid id',log,auditlog"
 		SecRule REQUEST_BODY "somecontent" "id:100, phase:2,deny, status:403,msg:'Invalid request body',log,auditlog"
 		SecRule RESPONSE_BODY "somecontent" "id:200, phase:4,deny, status:403,msg:'Invalid response body',log,auditlog"
@@ -70,6 +74,8 @@ func corazaRequestHandler(waf coraza.WAF, h http.Handler) http.Handler {
 			return
 		}
 		// We continue with the other middlewares by catching the response
+		body, _ := io.ReadAll(r.Body)
+		fmt.Println("Dumping Body:", string(body))
 		h.ServeHTTP(w, r)
 		// we must intercept the response body :(
 		if it, err := tx.ProcessResponseBody(); err != nil {
@@ -93,7 +99,7 @@ func corazaRequestHandler(waf coraza.WAF, h http.Handler) http.Handler {
 	return http.HandlerFunc(fn)
 }
 
-func processInterruption(w http.ResponseWriter, it *types.Interruption) {
+func processInterruption(w http.ResponseWriter, it *ctypes.Interruption) {
 	if it.Status == 0 {
 		it.Status = 500
 	}
@@ -111,4 +117,66 @@ func showCorazaError(w http.ResponseWriter, status int, msg string) {
 	if err != nil {
 		fmt.Println(err)
 	}
+}
+
+func logError(error ctypes.MatchedRule) {
+	msg := error.ErrorLog(0)
+	switch error.Rule.Severity {
+	case ctypes.RuleSeverityEmergency:
+	case ctypes.RuleSeverityAlert:
+	case ctypes.RuleSeverityCritical:
+		fmt.Println(msg)
+	case ctypes.RuleSeverityError:
+		fmt.Println(msg)
+	case ctypes.RuleSeverityWarning:
+		fmt.Println(msg)
+	case ctypes.RuleSeverityNotice:
+		fmt.Println(msg)
+	case ctypes.RuleSeverityInfo:
+		fmt.Println(msg)
+	case ctypes.RuleSeverityDebug:
+		fmt.Println(msg)
+	}
+}
+
+type debugLogger struct {
+	level loggers.LogLevel
+}
+
+func (l *debugLogger) Info(message string, args ...interface{}) {
+	if l.level >= loggers.LogLevelInfo {
+		fmt.Printf(message, args...)
+	}
+}
+
+func (l *debugLogger) Warn(message string, args ...interface{}) {
+	if l.level >= loggers.LogLevelWarn {
+		fmt.Printf(message, args...)
+	}
+}
+
+func (l *debugLogger) Error(message string, args ...interface{}) {
+	if l.level >= loggers.LogLevelError {
+		fmt.Printf(message, args...)
+	}
+}
+
+func (l *debugLogger) Debug(message string, args ...interface{}) {
+	if l.level >= loggers.LogLevelDebug {
+		fmt.Printf(message, args...)
+	}
+}
+
+func (l *debugLogger) Trace(message string, args ...interface{}) {
+	if l.level >= loggers.LogLevelTrace {
+		fmt.Printf(message, args...)
+	}
+}
+
+func (l *debugLogger) SetLevel(level loggers.LogLevel) {
+	l.level = level
+}
+
+func (l *debugLogger) SetOutput(w io.Writer) {
+	fmt.Println("ignoring SecDebugLog directive, debug logs are always routed to proxy logs")
 }
