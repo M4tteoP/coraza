@@ -4,7 +4,10 @@
 package corazawaf
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -213,27 +216,31 @@ func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) [
 					args, errs = r.executeTransformationsMultimatch(arg.Value())
 				} else {
 					// Final goal is args populated with the transformed value of arg.Value()
-					// Cache map: cache[Value][TrasformationID][TransformationOutput]
+					// Cache map: cache[arg.Value()/HASH][TransformationsUniqueID][TransformationOutput]
 
 					// First I check if we have the submap related to that value
-					// TODO: Hash instead of arg.Value()
-					if _, ok := cache[arg.Value()]; !ok {
+					// TODO: Hash instead of arg.Value() to avoid using things like the whole body as key?
+					valueSha, err := sha1T(arg.Value())
+					if err != nil {
+						tx.WAF.Logger.Debug("[%s] [%d] Error hashing argument %q for rule %d", tx.id, rid, arg.Value(), r.ID_)
+					}
+					if _, ok := cache[valueSha]; !ok {
 						// If I don't have it, let's create it
-						cache[arg.Value()] = map[string]string{}
+						cache[valueSha] = map[string]string{}
 					}
 					// Then I check if I already cached the transformation
-					if cachedVal, ok := cache[arg.Value()][r.transformationsUniqueID]; ok {
+					if cachedVal, ok := cache[valueSha][r.transformationsUniqueID]; ok {
 						// Cache hit!
-						tx.WAF.Logger.Error("Cache HIT")
+						// tx.WAF.Logger.Error("Cache HIT")
 						args = []string{cachedVal}
 
 					} else {
 						// I have to do the transformation and cache it
-						tx.WAF.Logger.Error("Cache MISS")
+						// tx.WAF.Logger.Error("Cache MISS")
 						ars, es := r.executeTransformations(arg.Value())
 						args = []string{ars}
 						errs = es
-						cache[arg.Value()][r.transformationsUniqueID] = ars
+						cache[valueSha][r.transformationsUniqueID] = ars
 					}
 
 				}
@@ -472,4 +479,13 @@ func NewRule() *Rule {
 			Tags_:  []string{},
 		},
 	}
+}
+
+func sha1T(data string) (string, error) {
+	h := sha1.New()
+	_, err := io.WriteString(h, data)
+	if err != nil {
+		return data, err
+	}
+	return string(hex.EncodeToString(h.Sum(nil))), nil
 }
