@@ -100,8 +100,8 @@ func (rg *RuleGroup) Eval(phase types.RulePhase, tx *Transaction) bool {
 	usedRules := 0
 	ts := time.Now().UnixNano()
 	// Caches transformations across the rules
-	// Rename name
-	cache := map[string]map[string]string{} // [Value][TrasformationID][TransformationOutput]
+	// TODO Rename name?
+	cache := map[string]string{} // [Value][TrasformationID][TransformationOutput]
 RulesLoop:
 	for _, r := range tx.WAF.Rules.GetRules() {
 		if tx.interruption != nil && phase != types.PhaseLogging {

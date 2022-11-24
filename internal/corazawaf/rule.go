@@ -4,10 +4,7 @@
 package corazawaf
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -160,11 +157,11 @@ func (r *Rule) Status() int {
 // Evaluate will evaluate the current rule for the indicated transaction
 // If the operator matches, actions will be evaluated, and it will return
 // the matched variables, keys and values (MatchData)
-func (r *Rule) Evaluate(tx rules.TransactionState, cache map[string]map[string]string) []types.MatchData {
+func (r *Rule) Evaluate(tx rules.TransactionState, cache map[string]string) []types.MatchData {
 	return r.doEvaluate(tx.(*Transaction), cache)
 }
 
-func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) []types.MatchData {
+func (r *Rule) doEvaluate(tx *Transaction, cache map[string]string) []types.MatchData {
 	if r.Capture {
 		tx.Capture = true
 	}
@@ -220,27 +217,23 @@ func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) [
 
 					// First I check if we have the submap related to that value
 					// TODO: Hash instead of arg.Value() to avoid using things like the whole body as key?
-					valueSha, err := sha1T(arg.Value())
-					if err != nil {
-						tx.WAF.Logger.Debug("[%s] [%d] Error hashing argument %q for rule %d", tx.id, rid, arg.Value(), r.ID_)
-					}
-					if _, ok := cache[valueSha]; !ok {
-						// If I don't have it, let's create it
-						cache[valueSha] = map[string]string{}
-					}
-					// Then I check if I already cached the transformation
-					if cachedVal, ok := cache[valueSha][r.transformationsUniqueID]; ok {
+					// cacheKey := arg.VariableName() + arg.Key() + r.transformationsUniqueID
+					cacheKey := arg.Value() + r.transformationsUniqueID
+					// I check if I already cached the transformation
+					if cachedVal, ok := cache[cacheKey]; ok {
 						// Cache hit!
 						// tx.WAF.Logger.Error("Cache HIT")
+						// fmt.Printf("HIT ")
 						args = []string{cachedVal}
 
 					} else {
 						// I have to do the transformation and cache it
 						// tx.WAF.Logger.Error("Cache MISS")
+						// fmt.Printf("MISS ")
 						ars, es := r.executeTransformations(arg.Value())
 						args = []string{ars}
 						errs = es
-						cache[valueSha][r.transformationsUniqueID] = ars
+						cache[cacheKey] = ars
 					}
 
 				}
@@ -479,13 +472,4 @@ func NewRule() *Rule {
 			Tags_:  []string{},
 		},
 	}
-}
-
-func sha1T(data string) (string, error) {
-	h := sha1.New()
-	_, err := io.WriteString(h, data)
-	if err != nil {
-		return data, err
-	}
-	return string(hex.EncodeToString(h.Sum(nil))), nil
 }
