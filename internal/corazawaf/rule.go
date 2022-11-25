@@ -4,10 +4,7 @@
 package corazawaf
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -219,17 +216,18 @@ func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) [
 					// Cache map: cache[arg.Value()/HASH][TransformationsUniqueID][TransformationOutput]
 
 					// First I check if we have the submap related to that value
-					// TODO: Hash instead of arg.Value() to avoid using things like the whole body as key?
-					valueSha, err := sha1T(arg.Value())
-					if err != nil {
-						tx.WAF.Logger.Debug("[%s] [%d] Error hashing argument %q for rule %d", tx.id, rid, arg.Value(), r.ID_)
-					}
-					if _, ok := cache[valueSha]; !ok {
+					// TODO: Find a smart way to create the key:
+					// - cryptographic hashes: are slow and overkill
+					// arg.VariableName() + arg.Key() does not create an unique key (e.g. ARGS_GET) and is not a key about the value
+					// instead of arg.Value() to avoid using things like the whole body as key?
+					cacheKey := arg.Value()
+
+					if _, ok := cache[cacheKey]; !ok {
 						// If I don't have it, let's create it
-						cache[valueSha] = map[string]string{}
+						cache[cacheKey] = map[string]string{}
 					}
 					// Then I check if I already cached the transformation
-					if cachedVal, ok := cache[valueSha][r.transformationsUniqueID]; ok {
+					if cachedVal, ok := cache[cacheKey][r.transformationsUniqueID]; ok {
 						// Cache hit!
 						// tx.WAF.Logger.Error("Cache HIT")
 						args = []string{cachedVal}
@@ -240,9 +238,8 @@ func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) [
 						ars, es := r.executeTransformations(arg.Value())
 						args = []string{ars}
 						errs = es
-						cache[valueSha][r.transformationsUniqueID] = ars
+						cache[cacheKey][r.transformationsUniqueID] = ars
 					}
-
 				}
 				if len(errs) > 0 {
 					tx.WAF.Logger.Debug("[%s] [%d] Error transforming argument %q for rule %d: %v", tx.id, rid, arg.Value(), r.ID_, errs)
@@ -479,13 +476,4 @@ func NewRule() *Rule {
 			Tags_:  []string{},
 		},
 	}
-}
-
-func sha1T(data string) (string, error) {
-	h := sha1.New()
-	_, err := io.WriteString(h, data)
-	if err != nil {
-		return data, err
-	}
-	return string(hex.EncodeToString(h.Sum(nil))), nil
 }
