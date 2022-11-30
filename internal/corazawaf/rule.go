@@ -218,8 +218,8 @@ func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) [
 					// First I check if we have the submap related to that value
 					// TODO: Find a smart way to create the key:
 					// - cryptographic hashes: are slow and overkill
-					// arg.VariableName() + arg.Key() does not create an unique key (e.g. ARGS_GET) and is not a key about the value
-					// instead of arg.Value() to avoid using things like the whole body as key?
+					// - arg.VariableName() + arg.Key() does not create an unique key (e.g. ARGS_GET) and is not a key about the value
+					// TODO: try map[variable enum+transformationsUniqueID]Collection
 					cacheKey := arg.Value()
 
 					if _, ok := cache[cacheKey]; !ok {
