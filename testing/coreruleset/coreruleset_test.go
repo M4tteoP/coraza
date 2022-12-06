@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -27,6 +28,7 @@ import (
 	"github.com/coreruleset/go-ftw/output"
 	"github.com/coreruleset/go-ftw/runner"
 	"github.com/coreruleset/go-ftw/test"
+	"github.com/mccutchen/go-httpbin/v2/httpbin"
 	"github.com/rs/zerolog"
 
 	"github.com/corazawaf/coraza/v3"
@@ -38,7 +40,7 @@ var crsReader fs.FS
 
 func init() {
 	fmt.Println("Preparing CRS...")
-	ver := "32e6d80419d386a330ddaf5e60047a4a1c38a160"
+	ver := "121d6e6bb99acda2f4766ce55d1a22387cc71b50"
 	if crs, err := downloadCRS(ver); err != nil {
 		panic(fmt.Sprintf("failed to download CRS: %s", err.Error()))
 	} else {
@@ -196,18 +198,37 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	app := httpbin.New()
+	testServer := httptest.NewServer(app)
+	client := http.Client{}
+	defer testServer.Close()
 	s := httptest.NewServer(txhttp.WrapHandler(waf, t.Logf, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Emulated httpbin behaviour: /anything endpoint acts as an echo server, writing back the request body
-		if r.URL.Path == "/anything" {
-			defer r.Body.Close()
-			w.Header().Set("Content-Type", "text/plain")
-			_, err = io.Copy(w, r.Body)
-			if err != nil {
-				t.Fatalf("handler can not read request body: %v", err)
-			}
-		} else {
+		w.Header().Set("Content-Type", "text/plain")
+		defer r.Body.Close()
+		// The request is sent to httpbin only if it is needed for processing the response
+		if r.URL.Path == "/status/200" ||
+			(r.URL.Path != "/anything" && !strings.HasPrefix(r.URL.Path, "/base64")) {
 			fmt.Fprintf(w, "Hello!")
+			return
+		}
+		r.RequestURI = ""
+		r.URL.Scheme = "http"
+		r.URL.Host = strings.TrimPrefix(testServer.URL, "http://")
+		r.Host = testServer.URL
+		response, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		} else {
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("handler can not read httpbin response body: %v", err)
+			}
+			if len(body) > 0 {
+				w.Write(body)
+			} else {
+				fmt.Fprintf(w, "Hello!")
+			}
 		}
 	})))
 	defer s.Close()
