@@ -161,6 +161,9 @@ func (r *Rule) Evaluate(tx rules.TransactionState, cache map[string]map[string]s
 	return r.doEvaluate(tx.(*Transaction), cache)
 }
 
+var counter = 0
+var lastKey = ""
+
 func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) []types.MatchData {
 	if r.Capture {
 		tx.Capture = true
@@ -216,29 +219,38 @@ func (r *Rule) doEvaluate(tx *Transaction, cache map[string]map[string]string) [
 					// Cache map: cache[arg.Value()/HASH][TransformationsUniqueID][TransformationOutput]
 
 					// First I check if we have the submap related to that value
-					// TODO: Find a smart way to create the key:
-					// - cryptographic hashes: are slow and overkill
-					// - arg.VariableName() + arg.Key() does not create an unique key (e.g. ARGS_GET) and is not a key about the value
-					// TODO: try map[variable enum+transformationsUniqueID]Collection
-					cacheKey := arg.Value()
-
-					if _, ok := cache[cacheKey]; !ok {
-						// If I don't have it, let's create it
-						cache[cacheKey] = map[string]string{}
-					}
-					// Then I check if I already cached the transformation
-					if cachedVal, ok := cache[cacheKey][r.transformationsUniqueID]; ok {
-						// Cache hit!
-						// tx.WAF.Logger.Error("Cache HIT")
-						args = []string{cachedVal}
-
-					} else {
-						// I have to do the transformation and cache it
-						// tx.WAF.Logger.Error("Cache MISS")
+					if arg.VariableName() == "TX" {
+						// no cache for TX
 						ars, es := r.executeTransformations(arg.Value())
 						args = []string{ars}
 						errs = es
-						cache[cacheKey][r.transformationsUniqueID] = ars
+					} else {
+						if lastKey != arg.Key()+arg.VariableName() {
+							counter = 0
+						} else {
+							counter++
+						}
+						cacheKey := arg.Key() + arg.VariableName() + strconv.Itoa(counter)
+						lastKey = arg.Key() + arg.VariableName()
+
+						if _, ok := cache[cacheKey]; !ok {
+							// If I don't have it, let's create it
+							cache[cacheKey] = map[string]string{}
+						}
+						// Then I check if I already cached the transformation
+						if cachedVal, ok := cache[cacheKey][r.transformationsUniqueID]; ok {
+							// Cache hit!
+							tx.WAF.Logger.Error("Cache HIT")
+							args = []string{cachedVal}
+
+						} else {
+							// I have to do the transformation and cache it
+							// tx.WAF.Logger.Error("Cache MISS")
+							ars, es := r.executeTransformations(arg.Value())
+							args = []string{ars}
+							errs = es
+							cache[cacheKey][r.transformationsUniqueID] = ars
+						}
 					}
 				}
 				if len(errs) > 0 {
