@@ -744,6 +744,12 @@ func (tx *Transaction) ProcessRequestHeaders() *types.Interruption {
 		// Rule engine is disabled
 		return nil
 	}
+
+	if tx.LastPhase == types.PhaseRequestHeaders {
+		// Phase already evaluated
+		return tx.interruption
+	}
+
 	tx.WAF.Rules.Eval(types.PhaseRequestHeaders, tx)
 	return tx.interruption
 }
@@ -763,6 +769,12 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 	if tx.RuleEngine == types.RuleEngineOff {
 		return nil, nil
 	}
+
+	if tx.LastPhase == types.PhaseRequestBody {
+		// Phase already evaluated
+		return tx.interruption, nil
+	}
+
 	// we won't process empty request bodies or disabled RequestBodyAccess
 	if !tx.RequestBodyAccess || tx.RequestBodyBuffer.Size() == 0 {
 		tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
@@ -847,6 +859,11 @@ func (tx *Transaction) ProcessResponseHeaders(code int, proto string) *types.Int
 		return nil
 	}
 
+	if tx.LastPhase == types.PhaseResponseHeaders {
+		// Phase already evaluated
+		return tx.interruption
+	}
+
 	tx.WAF.Rules.Eval(types.PhaseResponseHeaders, tx)
 	return tx.interruption
 }
@@ -877,6 +894,12 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 	if tx.RuleEngine == types.RuleEngineOff {
 		return tx.interruption, nil
 	}
+
+	if tx.LastPhase == types.PhaseResponseBody {
+		// Phase already evaluated
+		return tx.interruption, nil
+	}
+
 	if !tx.ResponseBodyAccess || !tx.IsResponseBodyProcessable() {
 		tx.WAF.Logger.Debug("[%s] Skipping response body processing (Access: %t)", tx.id, tx.ResponseBodyAccess)
 		tx.WAF.Rules.Eval(types.PhaseResponseBody, tx)
