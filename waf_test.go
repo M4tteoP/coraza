@@ -103,3 +103,26 @@ func TestResponseBodyLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestDirectiveOverridesProgrammaticValues(t *testing.T) {
+	// Programmatic values
+	cfg := NewWAFConfig().WithRequestBodyLimit(3).WithResponseBodyAccess()
+	// Directives
+	cfg = cfg.WithDirectives(`
+    SecRequestBodyLimit 2
+    SecResponseBodyAccess Off
+    `)
+	waf, err := NewWAF(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err.Error())
+	}
+	internalWAF := waf.(wafWrapper).waf
+
+	if internalWAF.RequestBodyLimit != 2 {
+		t.Errorf("unexpected RequestBodyLimit value, want: 2 have: %d", internalWAF.RequestBodyLimit)
+	}
+
+	if internalWAF.ResponseBodyAccess != false {
+		t.Errorf("unexpected ResponseBodyAccess, want: false have: %t", internalWAF.ResponseBodyAccess)
+	}
+}
