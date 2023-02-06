@@ -25,6 +25,8 @@ type WAF interface {
 	NewTransactionWithID(id string) types.Transaction
 }
 
+const _1gb = 1073741824
+
 // NewWAF creates a new WAF instance with the provided configuration.
 func NewWAF(config WAFConfig) (WAF, error) {
 	c := config.(*wafConfig)
@@ -73,29 +75,49 @@ func NewWAF(config WAFConfig) (WAF, error) {
 		}
 	}
 
-	if c.contentInjection {
-		waf.ContentInjection = true
+	if c.requestBodyAccess {
+		waf.RequestBodyAccess = true
 	}
 
-	if r := c.requestBody; r != nil {
-		if r.limit <= 0 {
+	if c.requestBodyLimit != unsetLimit {
+		if c.requestBodyLimit <= 0 {
 			return nil, errors.New("request body limit should be bigger than 0")
 		}
 
-		if r.limit < r.inMemoryLimit {
-			return nil, errors.New("request body limit should be at least the memory limit")
+		if c.requestBodyLimit > _1gb {
+			return nil, errors.New("request body limit should be at most 1GB")
 		}
-		waf.RequestBodyAccess = true
-		waf.RequestBodyLimit = int64(r.limit)
-		waf.RequestBodyInMemoryLimit = int64(r.inMemoryLimit)
+
+		waf.RequestBodyLimit = int64(c.requestBodyLimit)
 	}
 
-	if r := c.responseBody; r != nil {
-		if r.limit <= 0 {
+	if c.requestBodyInMemoryLimit != unsetLimit {
+		if c.requestBodyLimit != unsetLimit {
+			if c.requestBodyLimit < c.requestBodyInMemoryLimit {
+				return nil, errors.New("request body limit should be at least the memory limit")
+			}
+		}
+
+		if c.requestBodyInMemoryLimit <= 0 {
+			return nil, errors.New("request body memory limit should be bigger than 0")
+		}
+		waf.RequestBodyInMemoryLimit = int64(c.requestBodyInMemoryLimit)
+	}
+
+	if c.responseBodyAccess {
+		waf.ResponseBodyAccess = true
+	}
+
+	if c.responseBodyLimit != unsetLimit {
+		if c.responseBodyLimit <= 0 {
 			return nil, errors.New("response body limit should be bigger than 0")
 		}
-		waf.ResponseBodyAccess = true
-		waf.ResponseBodyLimit = int64(r.limit)
+
+		if c.responseBodyLimit > _1gb {
+			return nil, errors.New("response body limit should be at most 1GB")
+		}
+
+		waf.ResponseBodyLimit = int64(c.responseBodyLimit)
 	}
 
 	if c.errorCallback != nil {

@@ -4,7 +4,6 @@
 package seclang
 
 import (
-	"io"
 	"regexp"
 	"strings"
 	"testing"
@@ -318,9 +317,10 @@ func TestTxIssue147(t *testing.T) {
 	// we need a content-type header
 	tx.AddResponseHeader("Content-Type", "text/html")
 	if tx.IsResponseBodyProcessable() {
-		if _, err := tx.ResponseBodyBuffer.Write([]byte("#!/usr/bin/python")); err != nil {
+		if it, _, err := tx.WriteResponseBody([]byte("#!/usr/bin/python")); it != nil || err != nil {
 			t.Error(err)
 		}
+
 		it, err := tx.ProcessResponseBody()
 		if err != nil {
 			t.Error(err)
@@ -957,12 +957,17 @@ Content-Type: application/octet-stream
 
 BINARYDATA
 ------WebKitFormBoundaryABCDEFGIJKLMNOPQ--`)
-	_, err = io.Copy(tx.RequestBodyBuffer, body)
+	it, _, err := tx.ReadRequestBodyFrom(body)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	it, err := tx.ProcessRequestBody()
+
+	if it != nil {
+		t.Fatal(err)
+	}
+
+	it, err = tx.ProcessRequestBody()
 	if err != nil {
 		t.Error(err)
 		return

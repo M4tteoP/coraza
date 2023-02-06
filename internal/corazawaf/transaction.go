@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/url"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/corazawaf/coraza/v3/bodyprocessors"
 	"github.com/corazawaf/coraza/v3/collection"
+	"github.com/corazawaf/coraza/v3/internal/collections"
 	"github.com/corazawaf/coraza/v3/internal/corazarules"
 	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
 	urlutil "github.com/corazawaf/coraza/v3/internal/url"
@@ -66,10 +68,10 @@ type Transaction struct {
 	LastPhase types.RulePhase
 
 	// Handles request body buffers
-	RequestBodyBuffer *BodyBuffer
+	requestBodyBuffer *BodyBuffer
 
 	// Handles response body buffers
-	ResponseBodyBuffer *BodyBuffer
+	responseBodyBuffer *BodyBuffer
 
 	// Body processor used to parse JSON, XML, etc
 	bodyProcessor bodyprocessors.BodyProcessor
@@ -314,20 +316,16 @@ func (tx *Transaction) Interrupt(interruption *types.Interruption) {
 	}
 }
 
-func (tx *Transaction) ContentInjection() bool {
-	return tx.WAF.ContentInjection
-}
-
 func (tx *Transaction) DebugLogger() loggers.DebugLogger {
 	return tx.WAF.Logger
 }
 
 func (tx *Transaction) ResponseBodyReader() (io.Reader, error) {
-	return tx.ResponseBodyBuffer.Reader()
+	return tx.responseBodyBuffer.Reader()
 }
 
 func (tx *Transaction) RequestBodyReader() (io.Reader, error) {
-	return tx.RequestBodyBuffer.Reader()
+	return tx.requestBodyBuffer.Reader()
 }
 
 // AddRequestHeader Adds a request header
@@ -340,24 +338,22 @@ func (tx *Transaction) AddRequestHeader(key string, value string) {
 		return
 	}
 	keyl := strings.ToLower(key)
-	tx.variables.requestHeadersNames.AddUniqueCS(keyl, key, keyl)
-	tx.variables.requestHeaders.AddCS(keyl, key, value)
+	tx.variables.requestHeaders.Add(key, value)
 
-	if keyl == "content-type" {
+	switch keyl {
+	case "content-type":
 		val := strings.ToLower(value)
 		if val == "application/x-www-form-urlencoded" {
 			tx.variables.reqbodyProcessor.Set("URLENCODED")
 		} else if strings.HasPrefix(val, "multipart/form-data") {
 			tx.variables.reqbodyProcessor.Set("MULTIPART")
 		}
-	} else if keyl == "cookie" {
+	case "cookie":
 		// Cookies use the same syntax as GET params but with semicolon (;) separator
 		values := urlutil.ParseQuery(value, ';')
 		for k, vr := range values {
-			kl := strings.ToLower(k)
-			tx.variables.requestCookiesNames.AddUniqueCS(kl, k, kl)
 			for _, v := range vr {
-				tx.variables.requestCookies.AddCS(kl, k, v)
+				tx.variables.requestCookies.Add(k, v)
 			}
 		}
 	}
@@ -371,8 +367,7 @@ func (tx *Transaction) AddResponseHeader(key string, value string) {
 		return
 	}
 	keyl := strings.ToLower(key)
-	tx.variables.responseHeadersNames.AddUniqueCS(keyl, key, keyl)
-	tx.variables.responseHeaders.AddCS(keyl, key, value)
+	tx.variables.responseHeaders.Add(key, value)
 
 	// Most headers can be managed like that
 	if keyl == "content-type" {
@@ -447,13 +442,24 @@ func (tx *Transaction) ParseRequestReader(data io.Reader) (*types.Interruption, 
 		ct, _, _ = strings.Cut(ctcol[0], ";")
 	}
 	for scanner.Scan() {
-		if _, err := tx.RequestBodyBuffer.Write(scanner.Bytes()); err != nil {
+		it, _, err := tx.WriteRequestBody(scanner.Bytes())
+		if err != nil {
 			return nil, fmt.Errorf("cannot write to request body to buffer: %s", err.Error())
 		}
+
+		if it != nil {
+			return it, nil
+		}
+
 		// urlencoded cannot end with CRLF
 		if ct != "application/x-www-form-urlencoded" {
-			if _, err := tx.RequestBodyBuffer.Write([]byte{'\r', '\n'}); err != nil {
+			it, _, err := tx.WriteRequestBody([]byte{'\r', '\n'})
+			if err != nil {
 				return nil, fmt.Errorf("cannot write to request body to buffer: %s", err.Error())
+			}
+
+			if it != nil {
+				return it, nil
 			}
 		}
 	}
@@ -463,30 +469,21 @@ func (tx *Transaction) ParseRequestReader(data io.Reader) (*types.Interruption, 
 // matchVariable Creates the MATCHED_ variables required by chains and macro expansion
 // MATCHED_VARS, MATCHED_VAR, MATCHED_VAR_NAME, MATCHED_VARS_NAMES
 func (tx *Transaction) matchVariable(match *corazarules.MatchData) {
-	var varName, varNamel string
+	var varName string
 	if match.Key_ != "" {
 		varName = match.VariableName_ + ":" + match.Key_
-		varNamel = match.VariableName_ + ":" + strings.ToLower(match.Key_)
 	} else {
 		varName = match.VariableName_
-		varNamel = match.VariableName_
 	}
 	// Array of values
 	matchedVars := tx.variables.matchedVars
 	// Last key
 	matchedVarName := tx.variables.matchedVarName
 	matchedVarName.Reset()
-	// Array of keys
-	matchedVarsNames := tx.variables.matchedVarsNames
 
-	// We add the key in lowercase for ease of lookup in chains
-	// This is similar to args handling
-	matchedVars.AddCS(varNamel, varName, match.Value_)
+	matchedVars.Add(varName, match.Value_)
 	tx.variables.matchedVar.Set(match.Value_)
 
-	// We add the key in lowercase for ease of lookup in chains
-	// This is similar to args handling
-	matchedVarsNames.AddCS(varNamel, varName, varName)
 	matchedVarName.Set(varName)
 }
 
@@ -623,7 +620,6 @@ func (tx *Transaction) RemoveRuleByID(id int) {
 // ProcessConnection should be called at very beginning of a request process, it is
 // expected to be executed prior to the virtual host resolution, when the
 // connection arrives on the server.
-// Important: Remember to check for a possible intervention.
 func (tx *Transaction) ProcessConnection(client string, cPort int, server string, sPort int) {
 	p := strconv.Itoa(cPort)
 	p2 := strconv.Itoa(sPort)
@@ -658,7 +654,7 @@ func (tx *Transaction) ExtractArguments(orig types.ArgumentType, uri string) {
 // ARGS_(GET|POST)_NAMES
 func (tx *Transaction) AddArgument(argType types.ArgumentType, key string, value string) {
 	// TODO implement ARGS value limit using ArgumentsLimit
-	var vals *collection.Map
+	var vals collection.Map
 	switch argType {
 	case types.ArgumentGET:
 		vals = tx.variables.argsGet
@@ -669,9 +665,8 @@ func (tx *Transaction) AddArgument(argType types.ArgumentType, key string, value
 	default:
 		return
 	}
-	keyl := strings.ToLower(key)
 
-	vals.AddCS(keyl, key, value)
+	vals.Add(key, value)
 }
 
 // ProcessURI Performs the analysis on the URI and all the query string variables.
@@ -734,6 +729,17 @@ func (tx *Transaction) ProcessURI(uri string, method string, httpVersion string)
 	tx.variables.queryString.Set(query)
 }
 
+// SetServerName allows to set server name details.
+//
+// The API consumer is in charge of retrieving the value (e.g. from the host header).
+// It is expected to be executed before calling ProcessRequestHeaders.
+func (tx *Transaction) SetServerName(serverName string) {
+	if tx.LastPhase >= types.PhaseRequestHeaders {
+		tx.WAF.Logger.Warn("SetServerName has been called after ProcessRequestHeaders")
+	}
+	tx.variables.serverName.Set(serverName)
+}
+
 // ProcessRequestHeaders Performs the analysis on the request readers.
 //
 // This method perform the analysis on the request headers, notice however
@@ -760,14 +766,158 @@ func (tx *Transaction) ProcessRequestHeaders() *types.Interruption {
 	return tx.interruption
 }
 
-func (tx *Transaction) RequestBodyWriter() io.Writer {
-	return tx.RequestBodyBuffer
+func setAndReturnBodyLimitInterruption(tx *Transaction) (*types.Interruption, int, error) {
+	tx.DebugLogger().Warn("Disrupting transaction with body size above the configured limit (Action Reject)")
+	tx.interruption = &types.Interruption{
+		Status: 413,
+		Action: "deny",
+	}
+	return tx.interruption, 0, nil
 }
 
-// ProcessRequestBody Performs the request body (if any)
+// WriteRequestBody writes bytes from a slice of bytes into the request body,
+// it returns an interruption if the writing bytes go beyond the request body limit.
+// It won't copy the bytes if the body access isn't accessible.
+func (tx *Transaction) WriteRequestBody(b []byte) (*types.Interruption, int, error) {
+	if tx.RuleEngine == types.RuleEngineOff {
+		return nil, 0, nil
+	}
+
+	if !tx.RequestBodyAccess {
+		return nil, 0, nil
+	}
+
+	if tx.RequestBodyLimit == tx.requestBodyBuffer.length {
+		// tx.RequestBodyLimit will never be zero so if this happened, we have an
+		// interruption (that has been previously raised, but ignored by the connector) for sure.
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
+			return tx.interruption, 0, nil
+		}
+
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
+			return nil, 0, nil
+		}
+	}
+
+	var (
+		writingBytes          = int64(len(b))
+		runProcessRequestBody = false
+	)
+	// Overflow check
+	if tx.requestBodyBuffer.length >= (math.MaxInt64 - writingBytes) {
+		// Overflow, failing. MaxInt64 is not a realistic payload size. Furthermore, it has been tested that
+		// bytes.Buffer does not work with this kind of sizes. See comments in BodyBuffer Write(data []byte)
+		return nil, 0, errors.New("Overflow reached while writing request body")
+	}
+
+	if tx.requestBodyBuffer.length+writingBytes >= tx.RequestBodyLimit {
+		tx.variables.inboundErrorData.Set("1")
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
+			// We interrupt this transaction in case RequestBodyLimitAction is Reject
+			return setAndReturnBodyLimitInterruption(tx)
+		}
+
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
+			writingBytes = tx.RequestBodyLimit - tx.requestBodyBuffer.length
+			runProcessRequestBody = true
+		}
+	}
+
+	w, err := tx.requestBodyBuffer.Write(b[:writingBytes])
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if runProcessRequestBody {
+		tx.DebugLogger().Warn("Processing request body whose size reached the configured limit (Action ProcessPartial)")
+		_, err = tx.ProcessRequestBody()
+	}
+	return tx.interruption, int(w), err
+}
+
+// ByteLenger returns the length in bytes of a data stream.
+type ByteLenger interface {
+	Len() int
+}
+
+// ReadRequestBodyFrom writes bytes from a reader into the request body
+// it returns an interruption if the writing bytes go beyond the request body limit.
+// It won't read the reader if the body access isn't accessible.
+func (tx *Transaction) ReadRequestBodyFrom(r io.Reader) (*types.Interruption, int, error) {
+	if tx.RuleEngine == types.RuleEngineOff {
+		return nil, 0, nil
+	}
+
+	if !tx.RequestBodyAccess {
+		return nil, 0, nil
+	}
+
+	if tx.RequestBodyLimit == tx.requestBodyBuffer.length {
+		// tx.RequestBodyLimit will never be zero so if this happened, we have an
+		// interruption (that has been previously raised, but ignored by the connector) for sure.
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
+			return tx.interruption, 0, nil
+		}
+
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
+			return nil, 0, nil
+		}
+	}
+
+	var (
+		writingBytes          int64
+		runProcessRequestBody = false
+	)
+	if l, ok := r.(ByteLenger); ok {
+		writingBytes = int64(l.Len())
+		// Overflow check
+		if tx.requestBodyBuffer.length >= (math.MaxInt64 - writingBytes) {
+			// Overflow, failing. MaxInt64 is not a realistic payload size. Furthermore, it has been tested that
+			// bytes.Buffer does not work with this kind of sizes. See comments in BodyBuffer Write(data []byte)
+			return nil, 0, errors.New("Overflow reached while writing request body")
+		}
+		if tx.requestBodyBuffer.length+writingBytes >= tx.RequestBodyLimit {
+			tx.variables.inboundErrorData.Set("1")
+			if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
+				return setAndReturnBodyLimitInterruption(tx)
+			}
+
+			if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
+				writingBytes = tx.RequestBodyLimit - tx.requestBodyBuffer.length
+				runProcessRequestBody = true
+			}
+		}
+	} else {
+		writingBytes = tx.RequestBodyLimit - tx.requestBodyBuffer.length
+	}
+
+	w, err := io.CopyN(tx.requestBodyBuffer, r, writingBytes)
+	if err != nil && err != io.EOF {
+		return nil, int(w), err
+	}
+
+	if tx.requestBodyBuffer.length == tx.RequestBodyLimit {
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
+			return setAndReturnBodyLimitInterruption(tx)
+		}
+
+		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
+			runProcessRequestBody = true
+		}
+	}
+
+	err = nil
+	if runProcessRequestBody {
+		tx.DebugLogger().Warn("Processing request body whose size reached the configured limit (Action ProcessPartial)")
+		_, err = tx.ProcessRequestBody()
+	}
+	return tx.interruption, int(w), err
+}
+
+// ProcessRequestBody Performs the analysis of the request body (if any)
 //
 // This method perform the analysis on the request body. It is optional to
-// call that function. If this API consumer already know that there isn't a
+// call that function. If this API consumer already knows that there isn't a
 // body for inspect it is recommended to skip this step.
 //
 // Remember to check for a possible intervention.
@@ -778,7 +928,7 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 
 	if tx.LastPhase >= types.PhaseRequestBody {
 		// Phase already evaluated
-		tx.WAF.Logger.Error("ProcessRequestBody has already been called")
+		tx.WAF.Logger.Warn("ProcessRequestBody has already been called")
 		return tx.interruption, nil
 	}
 
@@ -788,7 +938,7 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 	}
 
 	// we won't process empty request bodies or disabled RequestBodyAccess
-	if !tx.RequestBodyAccess || tx.RequestBodyBuffer.Size() == 0 {
+	if !tx.RequestBodyAccess || tx.requestBodyBuffer.length == 0 {
 		tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
 		return tx.interruption, nil
 	}
@@ -797,28 +947,9 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 		mime = m[0]
 	}
 
-	reader, err := tx.RequestBodyBuffer.Reader()
+	reader, err := tx.requestBodyBuffer.Reader()
 	if err != nil {
 		return nil, err
-	}
-
-	// Chunked requests will always be written to a temporary file
-	if tx.RequestBodyBuffer.Size() >= tx.RequestBodyLimit {
-		tx.variables.inboundErrorData.Set("1")
-		if tx.WAF.RequestBodyLimitAction == types.RequestBodyLimitActionReject {
-			// We interrupt this transaction in case RequestBodyLimitAction is Reject
-			tx.interruption = &types.Interruption{
-				Status: 403,
-				Action: "deny",
-			}
-			return tx.interruption, nil
-		}
-
-		if tx.WAF.RequestBodyLimitAction == types.RequestBodyLimitActionProcessPartial {
-			tx.variables.inboundErrorData.Set("1")
-			// we limit our reader to tx.RequestBodyLimit bytes
-			reader = io.LimitReader(reader, tx.RequestBodyLimit)
-		}
 	}
 
 	rbp := tx.variables.reqbodyProcessor.String()
@@ -897,14 +1028,128 @@ func (tx *Transaction) IsResponseBodyProcessable() bool {
 	return stringsutil.InSlice(ct, tx.WAF.ResponseBodyMimeTypes)
 }
 
-func (tx *Transaction) ResponseBodyWriter() io.Writer {
-	return tx.ResponseBodyBuffer
+// WriteResponseBody writes bytes from a slice of bytes into the response body,
+// it returns an interruption if the writing bytes go beyond the response body limit.
+// It won't copy the bytes if the body access isn't accessible.
+func (tx *Transaction) WriteResponseBody(b []byte) (*types.Interruption, int, error) {
+	if tx.RuleEngine == types.RuleEngineOff {
+		return nil, 0, nil
+	}
+
+	if !tx.ResponseBodyAccess {
+		return nil, 0, nil
+	}
+
+	if tx.ResponseBodyLimit == tx.responseBodyBuffer.length {
+		// tx.ResponseBodyLimit will never be zero so if this happened, we have an
+		// interruption for sure.
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
+			return tx.interruption, 0, nil
+		}
+
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
+			return nil, 0, nil
+		}
+	}
+
+	var (
+		writingBytes           = int64(len(b))
+		runProcessResponseBody = false
+	)
+	if tx.responseBodyBuffer.length+writingBytes >= tx.ResponseBodyLimit {
+		// TODO: figure out ErrorData vs DataError: https://github.com/corazawaf/coraza/issues/564
+		tx.variables.outboundDataError.Set("1")
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
+			// We interrupt this transaction in case ResponseBodyLimitAction is Reject
+			return setAndReturnBodyLimitInterruption(tx)
+		}
+
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
+			writingBytes = tx.ResponseBodyLimit - tx.responseBodyBuffer.length
+			runProcessResponseBody = true
+		}
+	}
+	w, err := tx.responseBodyBuffer.Write(b[:writingBytes])
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if runProcessResponseBody {
+		_, err = tx.ProcessResponseBody()
+	}
+	return tx.interruption, int(w), err
 }
 
-// ProcessResponseBody Perform the request body (if any)
+// ReadResponseBodyFrom writes bytes from a reader into the response body
+// it returns an interruption if the writing bytes go beyond the response body limit.
+// It won't read the reader if the body access isn't accessible.
+func (tx *Transaction) ReadResponseBodyFrom(r io.Reader) (*types.Interruption, int, error) {
+	if tx.RuleEngine == types.RuleEngineOff {
+		return nil, 0, nil
+	}
+
+	if !tx.ResponseBodyAccess {
+		return nil, 0, nil
+	}
+
+	if tx.ResponseBodyLimit == tx.responseBodyBuffer.length {
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
+			return tx.interruption, 0, nil
+		}
+
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
+			return nil, 0, nil
+		}
+	}
+
+	var (
+		writingBytes           int64
+		runProcessResponseBody = false
+	)
+	if l, ok := r.(ByteLenger); ok {
+		writingBytes = int64(l.Len())
+		if tx.responseBodyBuffer.length+writingBytes >= tx.ResponseBodyLimit {
+			// TODO: figure out ErrorData vs DataError: https://github.com/corazawaf/coraza/issues/564
+			tx.variables.outboundDataError.Set("1")
+			if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
+				return setAndReturnBodyLimitInterruption(tx)
+			}
+
+			if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
+				writingBytes = tx.ResponseBodyLimit - tx.responseBodyBuffer.length
+				runProcessResponseBody = true
+			}
+		}
+	} else {
+		writingBytes = tx.ResponseBodyLimit - tx.responseBodyBuffer.length
+	}
+
+	w, err := io.CopyN(tx.responseBodyBuffer, r, writingBytes)
+	if err != nil && err != io.EOF {
+		return nil, int(w), err
+	}
+
+	if tx.responseBodyBuffer.length == tx.ResponseBodyLimit {
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
+			return setAndReturnBodyLimitInterruption(tx)
+		}
+
+		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
+			runProcessResponseBody = true
+		}
+	}
+
+	err = nil
+	if runProcessResponseBody {
+		_, err = tx.ProcessResponseBody()
+	}
+	return tx.interruption, int(w), err
+}
+
+// ProcessResponseBody Perform the analysis of the the response body (if any)
 //
-// This method perform the analysis on the request body. It is optional to
-// call that method. If this API consumer already know that there isn't a
+// This method perform the analysis on the response body. It is optional to
+// call that method. If this API consumer already knows that there isn't a
 // body for inspect it is recommended to skip this step.
 //
 // note Remember to check for a possible intervention.
@@ -915,7 +1160,7 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 
 	if tx.LastPhase >= types.PhaseResponseBody {
 		// Phase already evaluated
-		tx.WAF.Logger.Error("ProcessResponseBody has already been called")
+		tx.WAF.Logger.Warn("ProcessResponseBody has already been called")
 		return tx.interruption, nil
 	}
 
@@ -930,19 +1175,15 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 		return tx.interruption, nil
 	}
 	tx.WAF.Logger.Debug("[%s] Attempting to process response body", tx.id)
-	reader, err := tx.ResponseBodyBuffer.Reader()
-	if err != nil {
-		return tx.interruption, err
-	}
-	reader = io.LimitReader(reader, tx.WAF.ResponseBodyLimit)
-	buf := new(strings.Builder)
-	length, err := io.Copy(buf, reader)
+	reader, err := tx.responseBodyBuffer.Reader()
 	if err != nil {
 		return tx.interruption, err
 	}
 
-	if tx.ResponseBodyBuffer.Size() >= tx.WAF.ResponseBodyLimit {
-		tx.variables.outboundDataError.Set("1")
+	buf := new(strings.Builder)
+	length, err := io.Copy(buf, reader)
+	if err != nil {
+		return tx.interruption, err
 	}
 
 	tx.variables.responseContentLength.Set(strconv.FormatInt(length, 10))
@@ -1127,10 +1368,10 @@ func (tx *Transaction) Close() error {
 	defer tx.WAF.txPool.Put(tx)
 	tx.variables.reset()
 	var errs []error
-	if err := tx.RequestBodyBuffer.Reset(); err != nil {
+	if err := tx.requestBodyBuffer.Reset(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := tx.ResponseBodyBuffer.Reset(); err != nil {
+	if err := tx.responseBodyBuffer.Reset(); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -1174,12 +1415,8 @@ func (tx *Transaction) Debug() string {
 			data[""] = []string{
 				col.String(),
 			}
-		case *collection.Map:
+		case collection.Map:
 			data = col.Data()
-		case *collection.Proxy:
-			data = col.Data()
-		case *collection.TranslationProxy:
-			data[""] = col.Data()
 		}
 
 		if len(data) == 1 {
@@ -1214,7 +1451,7 @@ type TransactionVariables struct {
 	urlencodedError               *collection.Simple
 	responseContentType           *collection.Simple
 	uniqueID                      *collection.Simple
-	argsCombinedSize              *collection.SizeProxy
+	argsCombinedSize              *collections.SizeCollection
 	authType                      *collection.Simple
 	filesCombinedSize             *collection.Simple
 	fullRequest                   *collection.Simple
@@ -1268,42 +1505,39 @@ type TransactionVariables struct {
 	statusLine                    *collection.Simple
 	inboundErrorData              *collection.Simple
 	// Custom
-	env      *collection.Map
-	tx       *collection.Map
-	rule     *collection.Map
-	duration *collection.Simple
-	// Proxy Variables
-	args *collection.Proxy
-	// Maps Variables
-	argsGet              *collection.Map
-	argsPost             *collection.Map
-	argsPath             *collection.Map
-	filesTmpNames        *collection.Map
-	geo                  *collection.Map
-	files                *collection.Map
-	requestCookies       *collection.Map
-	requestHeaders       *collection.Map
-	responseHeaders      *collection.Map
-	multipartName        *collection.Map
-	matchedVarsNames     *collection.Map
-	multipartFilename    *collection.Map
-	matchedVars          *collection.Map
-	filesSizes           *collection.Map
-	filesNames           *collection.Map
-	filesTmpContent      *collection.Map
-	responseHeadersNames *collection.Map
-	requestHeadersNames  *collection.Map
-	requestCookiesNames  *collection.Map
-	xml                  *collection.Map
-	requestXML           *collection.Map
-	responseXML          *collection.Map
-	multipartPartHeaders *collection.Map
+	env                  collection.Map
+	tx                   collection.Map
+	rule                 collection.Map
+	duration             *collection.Simple
+	args                 *collections.ConcatCollection
+	argsGet              *collections.NamedCollection
+	argsGetNames         collection.Collection
+	argsPost             *collections.NamedCollection
+	argsPostNames        collection.Collection
+	argsPath             *collections.NamedCollection
+	argsNames            *collections.ConcatCollection
+	filesTmpNames        collection.Map
+	geo                  collection.Map
+	files                collection.Map
+	requestCookies       *collections.NamedCollection
+	requestCookiesNames  collection.Collection
+	requestHeaders       *collections.NamedCollection
+	responseHeadersNames collection.Collection
+	responseHeaders      *collections.NamedCollection
+	requestHeadersNames  collection.Collection
+	multipartName        collection.Map
+	multipartFilename    collection.Map
+	matchedVars          *collections.NamedCollection
+	matchedVarsNames     collection.Collection
+	filesSizes           collection.Map
+	filesNames           collection.Map
+	filesTmpContent      collection.Map
+	xml                  collection.Map
+	requestXML           collection.Map
+	responseXML          collection.Map
+	multipartPartHeaders collection.Map
 	// Persistent variables
-	ip *collection.Map
-	// Translation Proxy Variables
-	argsNames     *collection.TranslationProxy
-	argsGetNames  *collection.TranslationProxy
-	argsPostNames *collection.TranslationProxy
+	ip collection.Map
 }
 
 func NewTransactionVariables() *TransactionVariables {
@@ -1364,59 +1598,53 @@ func NewTransactionVariables() *TransactionVariables {
 	v.statusLine = collection.NewSimple(variables.StatusLine)
 	v.inboundErrorData = collection.NewSimple(variables.InboundErrorData)
 	v.duration = collection.NewSimple(variables.Duration)
-	v.responseHeadersNames = collection.NewMap(variables.ResponseHeadersNames)
-	v.requestHeadersNames = collection.NewMap(variables.RequestHeadersNames)
 	v.userID = collection.NewSimple(variables.Userid)
 
-	v.argsGet = collection.NewMap(variables.ArgsGet)
-	v.argsPost = collection.NewMap(variables.ArgsPost)
-	v.argsPath = collection.NewMap(variables.ArgsPath)
 	v.filesSizes = collection.NewMap(variables.FilesSizes)
 	v.filesTmpContent = collection.NewMap(variables.FilesTmpContent)
 	v.multipartFilename = collection.NewMap(variables.MultipartFilename)
 	v.multipartName = collection.NewMap(variables.MultipartName)
-	v.matchedVars = collection.NewMap(variables.MatchedVars)
-	v.requestCookies = collection.NewMap(variables.RequestCookies)
-	v.requestHeaders = collection.NewMap(variables.RequestHeaders)
-	v.responseHeaders = collection.NewMap(variables.ResponseHeaders)
+	v.matchedVars = collections.NewNamedCollection(variables.MatchedVars)
+	v.matchedVarsNames = v.matchedVars.Names(variables.MatchedVarsNames)
+	v.requestCookies = collections.NewNamedCollection(variables.RequestCookies)
+	v.requestCookiesNames = v.requestCookies.Names(variables.RequestCookiesNames)
+	v.requestHeaders = collections.NewNamedCollection(variables.RequestHeaders)
+	v.requestHeadersNames = v.requestHeaders.Names(variables.RequestHeadersNames)
+	v.responseHeaders = collections.NewNamedCollection(variables.ResponseHeaders)
+	v.responseHeadersNames = v.responseHeaders.Names(variables.ResponseHeadersNames)
 	v.geo = collection.NewMap(variables.Geo)
 	v.tx = collection.NewMap(variables.TX)
 	v.rule = collection.NewMap(variables.Rule)
 	v.env = collection.NewMap(variables.Env)
 	v.ip = collection.NewMap(variables.IP)
 	v.files = collection.NewMap(variables.Files)
-	v.matchedVarsNames = collection.NewMap(variables.MatchedVarsNames)
 	v.filesNames = collection.NewMap(variables.FilesNames)
 	v.filesTmpNames = collection.NewMap(variables.FilesTmpNames)
-	v.requestCookiesNames = collection.NewMap(variables.RequestCookiesNames)
 	v.responseXML = collection.NewMap(variables.ResponseXML)
 	v.requestXML = collection.NewMap(variables.RequestXML)
 	v.multipartPartHeaders = collection.NewMap(variables.MultipartPartHeaders)
 
-	v.argsCombinedSize = collection.NewCollectionSizeProxy(variables.ArgsCombinedSize, v.argsGet, v.argsPost)
-
 	// XML is a pointer to RequestXML
 	v.xml = v.requestXML
-	v.args = collection.NewProxy(
+
+	v.argsGet = collections.NewNamedCollection(variables.ArgsGet)
+	v.argsGetNames = v.argsGet.Names(variables.ArgsGetNames)
+	v.argsPost = collections.NewNamedCollection(variables.ArgsPost)
+	v.argsPostNames = v.argsPost.Names(variables.ArgsPostNames)
+	v.argsPath = collections.NewNamedCollection(variables.ArgsPath)
+	v.argsCombinedSize = collections.NewSizeCollection(variables.ArgsCombinedSize, v.argsGet, v.argsPost)
+	v.args = collections.NewConcatCollection(
 		variables.Args,
 		v.argsGet,
 		v.argsPost,
 		v.argsPath,
 	)
-
-	v.argsNames = collection.NewTranslationProxy(
+	v.argsNames = collections.NewConcatCollection(
 		variables.ArgsNames,
-		v.argsGet,
-		v.argsPost,
-		v.argsPath,
-	)
-	v.argsGetNames = collection.NewTranslationProxy(
-		variables.ArgsGetNames,
-		v.argsGet,
-	)
-	v.argsPostNames = collection.NewTranslationProxy(
-		variables.ArgsPostNames,
-		v.argsPost,
+		v.argsGetNames,
+		v.argsPostNames,
+		// Only used in a concatenating collection so variable name doesn't matter.
+		v.argsPath.Names(variables.Unknown),
 	)
 	return v
 }
@@ -1437,7 +1665,7 @@ func (v *TransactionVariables) UniqueID() *collection.Simple {
 	return v.uniqueID
 }
 
-func (v *TransactionVariables) ArgsCombinedSize() *collection.SizeProxy {
+func (v *TransactionVariables) ArgsCombinedSize() collection.Collection {
 	return v.argsCombinedSize
 }
 
@@ -1517,7 +1745,7 @@ func (v *TransactionVariables) MultipartMissingSemicolon() *collection.Simple {
 	return v.multipartMissingSemicolon
 }
 
-func (v *TransactionVariables) MultipartPartHeaders() *collection.Map {
+func (v *TransactionVariables) MultipartPartHeaders() collection.Map {
 	return v.multipartPartHeaders
 }
 
@@ -1653,15 +1881,15 @@ func (v *TransactionVariables) InboundErrorData() *collection.Simple {
 	return v.inboundErrorData
 }
 
-func (v *TransactionVariables) Env() *collection.Map {
+func (v *TransactionVariables) Env() collection.Map {
 	return v.env
 }
 
-func (v *TransactionVariables) TX() *collection.Map {
+func (v *TransactionVariables) TX() collection.Map {
 	return v.tx
 }
 
-func (v *TransactionVariables) Rule() *collection.Map {
+func (v *TransactionVariables) Rule() collection.Map {
 	return v.rule
 }
 
@@ -1669,111 +1897,111 @@ func (v *TransactionVariables) Duration() *collection.Simple {
 	return v.duration
 }
 
-func (v *TransactionVariables) Args() *collection.Proxy {
+func (v *TransactionVariables) Args() collection.Collection {
 	return v.args
 }
 
-func (v *TransactionVariables) ArgsGet() *collection.Map {
+func (v *TransactionVariables) ArgsGet() collection.Map {
 	return v.argsGet
 }
 
-func (v *TransactionVariables) ArgsPost() *collection.Map {
+func (v *TransactionVariables) ArgsPost() collection.Map {
 	return v.argsPost
 }
 
-func (v *TransactionVariables) ArgsPath() *collection.Map {
+func (v *TransactionVariables) ArgsPath() collection.Map {
 	return v.argsPath
 }
 
-func (v *TransactionVariables) FilesTmpNames() *collection.Map {
+func (v *TransactionVariables) FilesTmpNames() collection.Map {
 	return v.filesTmpNames
 }
 
-func (v *TransactionVariables) Geo() *collection.Map {
+func (v *TransactionVariables) Geo() collection.Map {
 	return v.geo
 }
 
-func (v *TransactionVariables) Files() *collection.Map {
+func (v *TransactionVariables) Files() collection.Map {
 	return v.files
 }
 
-func (v *TransactionVariables) RequestCookies() *collection.Map {
+func (v *TransactionVariables) RequestCookies() collection.Map {
 	return v.requestCookies
 }
 
-func (v *TransactionVariables) RequestHeaders() *collection.Map {
+func (v *TransactionVariables) RequestHeaders() collection.Map {
 	return v.requestHeaders
 }
 
-func (v *TransactionVariables) ResponseHeaders() *collection.Map {
+func (v *TransactionVariables) ResponseHeaders() collection.Map {
 	return v.responseHeaders
 }
 
-func (v *TransactionVariables) MultipartName() *collection.Map {
+func (v *TransactionVariables) MultipartName() collection.Map {
 	return v.multipartName
 }
 
-func (v *TransactionVariables) MatchedVarsNames() *collection.Map {
+func (v *TransactionVariables) MatchedVarsNames() collection.Collection {
 	return v.matchedVarsNames
 }
 
-func (v *TransactionVariables) MultipartFilename() *collection.Map {
+func (v *TransactionVariables) MultipartFilename() collection.Map {
 	return v.multipartFilename
 }
 
-func (v *TransactionVariables) MatchedVars() *collection.Map {
+func (v *TransactionVariables) MatchedVars() collection.Map {
 	return v.matchedVars
 }
 
-func (v *TransactionVariables) FilesSizes() *collection.Map {
+func (v *TransactionVariables) FilesSizes() collection.Map {
 	return v.filesSizes
 }
 
-func (v *TransactionVariables) FilesNames() *collection.Map {
+func (v *TransactionVariables) FilesNames() collection.Map {
 	return v.filesNames
 }
 
-func (v *TransactionVariables) FilesTmpContent() *collection.Map {
+func (v *TransactionVariables) FilesTmpContent() collection.Map {
 	return v.filesTmpContent
 }
 
-func (v *TransactionVariables) ResponseHeadersNames() *collection.Map {
+func (v *TransactionVariables) ResponseHeadersNames() collection.Collection {
 	return v.responseHeadersNames
 }
 
-func (v *TransactionVariables) RequestHeadersNames() *collection.Map {
+func (v *TransactionVariables) RequestHeadersNames() collection.Collection {
 	return v.requestHeadersNames
 }
 
-func (v *TransactionVariables) RequestCookiesNames() *collection.Map {
+func (v *TransactionVariables) RequestCookiesNames() collection.Collection {
 	return v.requestCookiesNames
 }
 
-func (v *TransactionVariables) XML() *collection.Map {
+func (v *TransactionVariables) XML() collection.Map {
 	return v.xml
 }
 
-func (v *TransactionVariables) RequestXML() *collection.Map {
+func (v *TransactionVariables) RequestXML() collection.Map {
 	return v.requestXML
 }
 
-func (v *TransactionVariables) ResponseXML() *collection.Map {
+func (v *TransactionVariables) ResponseXML() collection.Map {
 	return v.responseXML
 }
 
-func (v *TransactionVariables) IP() *collection.Map {
+func (v *TransactionVariables) IP() collection.Map {
 	return v.ip
 }
 
-func (v *TransactionVariables) ArgsNames() *collection.TranslationProxy {
+func (v *TransactionVariables) ArgsNames() collection.Collection {
 	return v.argsNames
 }
 
-func (v *TransactionVariables) ArgsGetNames() *collection.TranslationProxy {
+func (v *TransactionVariables) ArgsGetNames() collection.Collection {
 	return v.argsGetNames
 }
 
-func (v *TransactionVariables) ArgsPostNames() *collection.TranslationProxy {
+func (v *TransactionVariables) ArgsPostNames() collection.Collection {
 	return v.argsPostNames
 }
 
