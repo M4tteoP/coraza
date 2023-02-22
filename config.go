@@ -15,9 +15,6 @@ import (
 //
 // Note: WAFConfig is immutable. Each WithXXX function returns a new instance including the corresponding change.
 type WAFConfig interface {
-	// WithRules adds rules to the WAF.
-	WithRules(rules ...*corazawaf.Rule) WAFConfig
-
 	// WithDirectives parses the directives from the given string and adds them to the WAF.
 	WithDirectives(directives string) WAFConfig
 
@@ -70,15 +67,9 @@ type WAFConfig interface {
 	WithRootFS(fs fs.FS) WAFConfig
 }
 
-const unsetLimit = -1
-
 // NewWAFConfig creates a new WAFConfig with the default settings.
 func NewWAFConfig() WAFConfig {
-	return &wafConfig{
-		requestBodyLimit:         unsetLimit,
-		requestBodyInMemoryLimit: unsetLimit,
-		responseBodyLimit:        unsetLimit,
-	}
+	return &wafConfig{}
 }
 
 // AuditLogConfig controls audit logging.
@@ -111,10 +102,10 @@ type wafConfig struct {
 	rules                    []wafRule
 	auditLog                 *auditLogConfig
 	requestBodyAccess        bool
-	requestBodyLimit         int
-	requestBodyInMemoryLimit int
+	requestBodyLimit         *int
+	requestBodyInMemoryLimit *int
 	responseBodyAccess       bool
-	responseBodyLimit        int
+	responseBodyLimit        *int
 	responseBodyMimeTypes    []string
 	debugLogger              loggers.DebugLogger
 	errorCallback            func(rule types.MatchedRule)
@@ -191,19 +182,19 @@ func (c *wafConfig) clone() *wafConfig {
 
 func (c *wafConfig) WithRequestBodyLimit(limit int) WAFConfig {
 	ret := c.clone()
-	ret.requestBodyLimit = limit
+	ret.requestBodyLimit = &limit
 	return ret
 }
 
 func (c *wafConfig) WithRequestBodyInMemoryLimit(limit int) WAFConfig {
 	ret := c.clone()
-	ret.requestBodyInMemoryLimit = limit
+	ret.requestBodyInMemoryLimit = &limit
 	return ret
 }
 
 func (c *wafConfig) WithResponseBodyLimit(limit int) WAFConfig {
 	ret := c.clone()
-	ret.responseBodyLimit = limit
+	ret.responseBodyLimit = &limit
 	return ret
 }
 

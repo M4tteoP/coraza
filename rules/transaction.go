@@ -31,6 +31,7 @@ type TransactionState interface {
 	// TODO(anuraaga): Should this be combined with interruption? Any action writing anything to response can be dangerous.
 	// ResponseBodyWriter() io.Writer
 	WriteResponseBody(b []byte) (*types.Interruption, int, error)
+
 	ReadResponseBodyFrom(io.Reader) (*types.Interruption, int, error)
 
 	// DebugLogger returns the logger for this transaction.
@@ -45,70 +46,56 @@ type TransactionState interface {
 
 // TransactionVariables has pointers to all the variables of the transaction
 type TransactionVariables interface {
+	// All iterates over all the variables in this TransactionVariables, invoking f for each.
+	// Results are passed in no defined order. If f returns false, iteration stops.
+	All(f func(v variables.RuleVariable, col collection.Collection) bool)
+
 	// Simple Variables
-	UserID() *collection.Simple
-	UrlencodedError() *collection.Simple
-	ResponseContentType() *collection.Simple
-	UniqueID() *collection.Simple
+	UrlencodedError() collection.Single
+	ResponseContentType() collection.Single
+	UniqueID() collection.Single
 	ArgsCombinedSize() collection.Collection
-	AuthType() *collection.Simple
-	FilesCombinedSize() *collection.Simple
-	FullRequest() *collection.Simple
-	FullRequestLength() *collection.Simple
-	InboundDataError() *collection.Simple
-	MatchedVar() *collection.Simple
-	MatchedVarName() *collection.Simple
-	MultipartBoundaryQuoted() *collection.Simple
-	MultipartBoundaryWhitespace() *collection.Simple
-	MultipartCrlfLfLines() *collection.Simple
-	MultipartDataAfter() *collection.Simple
-	MultipartDataBefore() *collection.Simple
-	MultipartFileLimitExceeded() *collection.Simple
+	FilesCombinedSize() collection.Single
+	FullRequestLength() collection.Single
+	InboundDataError() collection.Single
+	MatchedVar() collection.Single
+	MatchedVarName() collection.Single
+	MultipartDataAfter() collection.Single
 	MultipartPartHeaders() collection.Map
-	MultipartHeaderFolding() *collection.Simple
-	MultipartInvalidHeaderFolding() *collection.Simple
-	MultipartInvalidPart() *collection.Simple
-	MultipartInvalidQuoting() *collection.Simple
-	MultipartLfLine() *collection.Simple
-	MultipartMissingSemicolon() *collection.Simple
-	MultipartStrictError() *collection.Simple
-	MultipartUnmatchedBoundary() *collection.Simple
-	OutboundDataError() *collection.Simple
-	PathInfo() *collection.Simple
-	QueryString() *collection.Simple
-	RemoteAddr() *collection.Simple
-	RemoteHost() *collection.Simple
-	RemotePort() *collection.Simple
-	RequestBodyError() *collection.Simple
-	RequestBodyErrorMsg() *collection.Simple
-	RequestBodyProcessorError() *collection.Simple
-	RequestBodyProcessorErrorMsg() *collection.Simple
-	RequestBodyProcessor() *collection.Simple
-	RequestBasename() *collection.Simple
-	RequestBody() *collection.Simple
-	RequestBodyLength() *collection.Simple
-	RequestFilename() *collection.Simple
-	RequestLine() *collection.Simple
-	RequestMethod() *collection.Simple
-	RequestProtocol() *collection.Simple
-	RequestURI() *collection.Simple
-	RequestURIRaw() *collection.Simple
-	ResponseBody() *collection.Simple
-	ResponseContentLength() *collection.Simple
-	ResponseProtocol() *collection.Simple
-	ResponseStatus() *collection.Simple
-	ServerAddr() *collection.Simple
-	ServerName() *collection.Simple
-	ServerPort() *collection.Simple
-	SessionID() *collection.Simple
-	HighestSeverity() *collection.Simple
-	StatusLine() *collection.Simple
-	InboundErrorData() *collection.Simple
+	OutboundDataError() collection.Single
+	QueryString() collection.Single
+	RemoteAddr() collection.Single
+	RemoteHost() collection.Single
+	RemotePort() collection.Single
+	RequestBodyError() collection.Single
+	RequestBodyErrorMsg() collection.Single
+	RequestBodyProcessorError() collection.Single
+	RequestBodyProcessorErrorMsg() collection.Single
+	RequestBodyProcessor() collection.Single
+	RequestBasename() collection.Single
+	RequestBody() collection.Single
+	RequestBodyLength() collection.Single
+	RequestFilename() collection.Single
+	RequestLine() collection.Single
+	RequestMethod() collection.Single
+	RequestProtocol() collection.Single
+	RequestURI() collection.Single
+	RequestURIRaw() collection.Single
+	ResponseBody() collection.Single
+	ResponseContentLength() collection.Single
+	ResponseProtocol() collection.Single
+	ResponseStatus() collection.Single
+	ServerAddr() collection.Single
+	ServerName() collection.Single
+	ServerPort() collection.Single
+	HighestSeverity() collection.Single
+	StatusLine() collection.Single
+	InboundErrorData() collection.Single
 	Env() collection.Map
 	TX() collection.Map
 	Rule() collection.Map
-	Duration() *collection.Simple
-	Args() collection.Collection
+	Duration() collection.Single
+	Args() collection.Keyed
 	ArgsGet() collection.Map
 	ArgsPost() collection.Map
 	ArgsPath() collection.Map
@@ -131,7 +118,6 @@ type TransactionVariables interface {
 	XML() collection.Map
 	RequestXML() collection.Map
 	ResponseXML() collection.Map
-	IP() collection.Map
 	ArgsNames() collection.Collection
 	ArgsGetNames() collection.Collection
 	ArgsPostNames() collection.Collection

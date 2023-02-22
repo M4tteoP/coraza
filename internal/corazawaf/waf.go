@@ -4,6 +4,7 @@
 package corazawaf
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/corazawaf/coraza/v3/internal/environment"
 	ioutils "github.com/corazawaf/coraza/v3/internal/io"
 	stringutils "github.com/corazawaf/coraza/v3/internal/strings"
 	"github.com/corazawaf/coraza/v3/internal/sync"
@@ -49,7 +51,7 @@ type WAF struct {
 	RequestBodyLimit int64
 
 	// Request body in memory limit
-	RequestBodyInMemoryLimit int64
+	requestBodyInMemoryLimit *int64
 
 	// If true, transactions will have access to the response body
 	ResponseBodyAccess bool
@@ -149,9 +151,9 @@ func (w *WAF) newTransactionWithID(id string) *Transaction {
 	tx.AuditLogParts = w.AuditLogParts
 	tx.ForceRequestBodyVariable = false
 	tx.RequestBodyAccess = w.RequestBodyAccess
-	tx.RequestBodyLimit = w.RequestBodyLimit
+	tx.RequestBodyLimit = int64(w.RequestBodyLimit)
 	tx.ResponseBodyAccess = w.ResponseBodyAccess
-	tx.ResponseBodyLimit = w.ResponseBodyLimit
+	tx.ResponseBodyLimit = int64(w.ResponseBodyLimit)
 	tx.RuleEngine = w.RuleEngine
 	tx.HashEngine = false
 	tx.HashEnforcement = false
@@ -160,6 +162,7 @@ func (w *WAF) newTransactionWithID(id string) *Transaction {
 	tx.ruleRemoveByID = nil
 	tx.ruleRemoveTargetByID = map[int][]ruleVariableParams{}
 	tx.Skip = 0
+	tx.AllowType = 0
 	tx.Capture = false
 	tx.stopWatches = map[types.RulePhase]int64{}
 	tx.WAF = w
@@ -169,17 +172,25 @@ func (w *WAF) newTransactionWithID(id string) *Transaction {
 	// Always non-nil if buffers / collections were already initialized so we don't do any of them
 	// based on the presence of RequestBodyBuffer.
 	if tx.requestBodyBuffer == nil {
+		// if no requestBodyInMemoryLimit has been set we default to the
+		var requestBodyInMemoryLimit int64 = w.RequestBodyLimit
+		if w.requestBodyInMemoryLimit != nil {
+			requestBodyInMemoryLimit = int64(*w.requestBodyInMemoryLimit)
+		}
+
 		tx.requestBodyBuffer = NewBodyBuffer(types.BodyBufferOptions{
 			TmpPath:     w.TmpDir,
-			MemoryLimit: w.RequestBodyInMemoryLimit,
-			Limit:       w.ResponseBodyLimit,
+			MemoryLimit: requestBodyInMemoryLimit,
+			Limit:       w.RequestBodyLimit,
 		})
+
 		tx.responseBodyBuffer = NewBodyBuffer(types.BodyBufferOptions{
 			TmpPath: w.TmpDir,
 			// the response body is just buffered in memory. Therefore, Limit and MemoryLimit are equal.
 			MemoryLimit: w.ResponseBodyLimit,
 			Limit:       w.ResponseBodyLimit,
 		})
+
 		tx.variables = *NewTransactionVariables()
 		tx.transformationCache = map[transformationKey]*transformationValue{}
 	}
@@ -194,20 +205,7 @@ func (w *WAF) newTransactionWithID(id string) *Transaction {
 	tx.variables.filesCombinedSize.Set("0")
 	tx.variables.urlencodedError.Set("0")
 	tx.variables.fullRequestLength.Set("0")
-	tx.variables.multipartBoundaryQuoted.Set("0")
-	tx.variables.multipartBoundaryWhitespace.Set("0")
-	tx.variables.multipartCrlfLfLines.Set("0")
 	tx.variables.multipartDataAfter.Set("0")
-	tx.variables.multipartDataBefore.Set("0")
-	tx.variables.multipartFileLimitExceeded.Set("0")
-	tx.variables.multipartHeaderFolding.Set("0")
-	tx.variables.multipartInvalidHeaderFolding.Set("0")
-	tx.variables.multipartInvalidPart.Set("0")
-	tx.variables.multipartInvalidQuoting.Set("0")
-	tx.variables.multipartLfLine.Set("0")
-	tx.variables.multipartMissingSemicolon.Set("0")
-	tx.variables.multipartStrictError.Set("0")
-	tx.variables.multipartUnmatchedBoundary.Set("0")
 	tx.variables.outboundDataError.Set("0")
 	tx.variables.reqbodyError.Set("0")
 	tx.variables.reqbodyProcessorError.Set("0")
@@ -242,7 +240,7 @@ func (w *WAF) SetDebugLogPath(path string) error {
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		w.Logger.Error("failed to open the file: %s", err.Error())
+		w.Logger.Error("failed to open the debug log file: %s", err.Error())
 	}
 
 	w.Logger.SetOutput(f)
@@ -250,45 +248,41 @@ func (w *WAF) SetDebugLogPath(path string) error {
 	return nil
 }
 
+const _1gb = 1073741824
+
 // NewWAF creates a new WAF instance with default variables
 func NewWAF() *WAF {
 	logger := &stdDebugLogger{
 		logger: &log.Logger{},
 		Level:  loggers.LogLevelInfo,
 	}
+
 	logWriter, err := loggers.GetLogWriter("serial")
 	if err != nil {
 		logger.Error("error creating serial log writer: %s", err.Error())
 	}
+
 	waf := &WAF{
 		// Initializing pool for transactions
-		txPool:                   sync.NewPool(func() interface{} { return new(Transaction) }),
-		ArgumentSeparator:        "&",
-		AuditLogWriter:           logWriter,
-		AuditEngine:              types.AuditEngineOff,
-		AuditLogParts:            types.AuditLogParts("ABCFHZ"),
-		RequestBodyAccess:        false,
-		RequestBodyInMemoryLimit: 131072,
-		RequestBodyLimit:         134217728, // 10mb
-		RequestBodyLimitAction:   types.BodyLimitActionReject,
-		ResponseBodyMimeTypes:    []string{"text/html", "text/plain"},
-		ResponseBodyLimit:        524288,
-		ResponseBodyLimitAction:  types.BodyLimitActionReject,
-		ResponseBodyAccess:       false,
-		RuleEngine:               types.RuleEngineOn,
-		Rules:                    NewRuleGroup(),
-		TmpDir:                   "/tmp",
-		AuditLogRelevantStatus:   regexp.MustCompile(`.*`),
-		Logger:                   logger,
+		txPool: sync.NewPool(func() interface{} { return new(Transaction) }),
+		// These defaults are unavoidable as they are zero values for the variables
+		RuleEngine:         types.RuleEngineOn,
+		RequestBodyAccess:  false,
+		RequestBodyLimit:   _1gb,
+		ResponseBodyAccess: false,
+		ResponseBodyLimit:  _1gb,
+		AuditLogWriter:     logWriter,
+		Logger:             logger,
 	}
-	// We initialize a basic audit log writer that discards output
-	if err := logWriter.Init(types.Config{}); err != nil {
-		fmt.Println(err)
+
+	if environment.HasAccessToFS {
+		waf.TmpDir = os.TempDir()
 	}
+
 	if err := waf.SetDebugLogPath(""); err != nil {
 		fmt.Println(err)
 	}
-	waf.Logger.Debug("a new waf instance was created")
+	waf.Logger.Debug("a new WAF instance was created")
 	return waf
 }
 
@@ -304,4 +298,43 @@ func (w *WAF) SetDebugLogLevel(lvl int) error {
 // helpers to write modsecurity style logs
 func (w *WAF) SetErrorCallback(cb func(rule types.MatchedRule)) {
 	w.ErrorLogCb = cb
+}
+
+func (w *WAF) SetRequestBodyInMemoryLimit(limit int64) {
+	w.requestBodyInMemoryLimit = &limit
+}
+
+func (w *WAF) RequestBodyInMemoryLimit() *int64 {
+	return w.requestBodyInMemoryLimit
+}
+
+// Validate validates the waf after all the settings have been set.
+func (w *WAF) Validate() error {
+	if w.RequestBodyLimit <= 0 {
+		return errors.New("request body limit should be bigger than 0")
+	}
+
+	if w.RequestBodyLimit > _1gb {
+		return errors.New("request body limit should be at most 1GB")
+	}
+
+	if w.requestBodyInMemoryLimit != nil {
+		if *w.requestBodyInMemoryLimit <= 0 {
+			return errors.New("request body memory limit should be bigger than 0")
+		}
+
+		if w.RequestBodyLimit < *w.requestBodyInMemoryLimit {
+			return fmt.Errorf("request body limit should be at least the memory limit")
+		}
+	}
+
+	if w.ResponseBodyLimit <= 0 {
+		return errors.New("response body limit should be bigger than 0")
+	}
+
+	if w.ResponseBodyLimit > _1gb {
+		return errors.New("response body limit should be at most 1GB")
+	}
+
+	return nil
 }

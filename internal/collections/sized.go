@@ -4,6 +4,7 @@
 package collections
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 
@@ -15,7 +16,6 @@ import (
 
 type SizeCollection struct {
 	data     []*NamedCollection
-	name     string
 	variable variables.RuleVariable
 }
 
@@ -25,7 +25,6 @@ var _ collection.Collection = &SizeCollection{}
 // only returns the total sum of all the collections values
 func NewSizeCollection(variable variables.RuleVariable, data ...*NamedCollection) *SizeCollection {
 	return &SizeCollection{
-		name:     variable.Name(),
 		variable: variable,
 		data:     data,
 	}
@@ -45,21 +44,19 @@ func (c *SizeCollection) FindString(string) []types.MatchData {
 func (c *SizeCollection) FindAll() []types.MatchData {
 	return []types.MatchData{
 		&corazarules.MatchData{
-			VariableName_: c.name,
-			Variable_:     c.variable,
-			Value_:        strconv.Itoa(c.size()),
+			Variable_: c.variable,
+			Value_:    strconv.Itoa(c.size()),
 		},
 	}
 }
 
 // Name returns the name for the current CollectionSizeProxy
 func (c *SizeCollection) Name() string {
-	return c.name
+	return c.variable.Name()
 }
 
-// Reset the current CollectionSizeProxy
-func (c *SizeCollection) Reset() {
-	// do nothing
+func (c *SizeCollection) String() string {
+	return fmt.Sprintf("%s: %d", c.variable.Name(), c.size())
 }
 
 // Size returns the size of all the collections values
@@ -67,9 +64,9 @@ func (c *SizeCollection) size() int {
 	i := 0
 	for _, d := range c.data {
 		// we iterate over d
-		for _, data := range d.Data() {
+		for _, data := range d.data {
 			for _, v := range data {
-				i += len(v)
+				i += len(v.value)
 			}
 		}
 	}
