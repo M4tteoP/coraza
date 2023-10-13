@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/corazawaf/coraza/v3"
+	"github.com/corazawaf/coraza/v3/debuglog"
 	txhttp "github.com/corazawaf/coraza/v3/http"
 	"github.com/corazawaf/coraza/v3/types"
 )
@@ -40,15 +41,21 @@ func main() {
 }
 
 func createWAF() coraza.WAF {
-	directivesFile := "./default.conf"
+	directivesFile := "../../coraza.conf-recommended"
 	if s := os.Getenv("DIRECTIVES_FILE"); s != "" {
 		directivesFile = s
 	}
 
+	logger := debuglog.Default().
+		WithLevel(debuglog.LevelDebug)
+
 	waf, err := coraza.NewWAF(
 		coraza.NewWAFConfig().
 			WithErrorCallback(logError).
-			WithDirectivesFromFile(directivesFile),
+			WithDirectivesFromFile(directivesFile).
+			WithDirectivesFromFile("./coreruleset-4.0.0-rc1/crs-setup.conf.example").
+			WithDirectivesFromFile("./coreruleset-4.0.0-rc1/rules/*.conf").
+			WithDebugLogger(logger),
 	)
 	if err != nil {
 		log.Fatal(err)
