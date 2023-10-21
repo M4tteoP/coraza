@@ -53,6 +53,7 @@ func createWAF() coraza.WAF {
 		coraza.NewWAFConfig().
 			WithErrorCallback(logError).
 			WithDirectivesFromFile(directivesFile).
+			WithDirectives("SecRule REQUEST_HEADERS:x-a-suspicious \"@contains true\" \"phase:1,log,deny,id:10000000\"").
 			WithDirectivesFromFile("./coreruleset-4.0.0-rc1/crs-setup.conf.example").
 			WithDirectivesFromFile("./coreruleset-4.0.0-rc1/rules/*.conf").
 			WithDebugLogger(logger),
