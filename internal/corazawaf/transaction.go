@@ -1,16 +1,18 @@
-// Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
+// Copyright 2024 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
 package corazawaf
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"mime"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,8 +24,10 @@ import (
 	"github.com/corazawaf/coraza/v3/internal/auditlog"
 	"github.com/corazawaf/coraza/v3/internal/bodyprocessors"
 	"github.com/corazawaf/coraza/v3/internal/collections"
+	"github.com/corazawaf/coraza/v3/internal/cookies"
 	"github.com/corazawaf/coraza/v3/internal/corazarules"
 	"github.com/corazawaf/coraza/v3/internal/corazatypes"
+	"github.com/corazawaf/coraza/v3/internal/environment"
 	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
 	urlutil "github.com/corazawaf/coraza/v3/internal/url"
 	"github.com/corazawaf/coraza/v3/types"
@@ -41,6 +45,9 @@ type Transaction struct {
 	// Transaction ID
 	id string
 
+	// The context associated to the transaction.
+	context context.Context
+
 	// Contains the list of matched rules and associated match information
 	matchedRules []types.MatchedRule
 
@@ -48,6 +55,7 @@ type Transaction struct {
 	interruption *types.Interruption
 
 	// This is used to store log messages
+	// Deprecated since Coraza 3.0.5: this variable is not used, logdata values are stored in the matched rules
 	Logdata string
 
 	// Rules will be skipped after a rule with this SecMarker is found
@@ -319,8 +327,21 @@ func (tx *Transaction) AddRequestHeader(key string, value string) {
 			tx.variables.reqbodyProcessor.Set("MULTIPART")
 		}
 	case "cookie":
-		// Cookies use the same syntax as GET params but with semicolon (;) separator
-		values := urlutil.ParseQuery(value, ';')
+		// 4.2.  Cookie
+		//
+		// 4.2.1.  Syntax
+		//
+		//   The user agent sends stored cookies to the origin server in the
+		//   Cookie header.  If the server conforms to the requirements in
+		//   Section 4.1 (and the user agent conforms to the requirements in
+		//   Section 5), the user agent will send a Cookie header that conforms to
+		//   the following grammar:
+		//
+		//   cookie-header = "Cookie:" OWS cookie-string OWS
+		//   cookie-string = cookie-pair *( ";" SP cookie-pair )
+		//
+		// There is no URL Decode performed no the cookies
+		values := cookies.ParseCookies(value)
 		for k, vr := range values {
 			for _, v := range vr {
 				tx.variables.requestCookies.Add(k, v)
@@ -486,6 +507,7 @@ func (tx *Transaction) MatchRule(r *Rule, mds []types.MatchData) {
 		Rule_:            &r.RuleMetadata,
 		Log_:             r.Log,
 		MatchedDatas_:    mds,
+		Context_:         tx.context,
 	}
 	// Populate MatchedRule disruption related fields only if the Engine is capable of performing disruptive actions
 	if tx.RuleEngine == types.RuleEngineOn {
@@ -534,7 +556,7 @@ func (tx *Transaction) GetStopWatch() string {
 }
 
 // GetField Retrieve data from collections applying exceptions
-// In future releases we may remove de exceptions slice and
+// In future releases we may remove the exceptions slice and
 // make it easier to use
 func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 	col := tx.Collection(rv.Variable)
@@ -561,29 +583,25 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 		matches = col.FindAll()
 	}
 
-	var rmi []int
-	for i, c := range matches {
+	// in the most common scenario filteredMatches length will be
+	// the same as matches length, so we avoid allocating per result
+	filteredMatches := make([]types.MatchData, 0, len(matches))
+
+	for _, c := range matches {
+		isException := false
+		lkey := strings.ToLower(c.Key())
 		for _, ex := range rv.Exceptions {
-			lkey := strings.ToLower(c.Key())
-			// in case it matches the regex or the keyStr
-			// Since keys are case sensitive we need to check with lower case
 			if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey {
-				// we remove the exception from the list of values
-				// we tried with standard append, but it fails... let's do some hacking
-				// m2 := append(matches[:i], matches[i+1:]...)
-				rmi = append(rmi, i)
+				isException = true
+				break
 			}
 		}
-	}
-	// we read the list of indexes backwards
-	// then we remove each one of them because of the exceptions
-	for i := len(rmi) - 1; i >= 0; i-- {
-		if len(matches) < rmi[i]+1 {
-			matches = matches[:rmi[i]-1]
-		} else {
-			matches = append(matches[:rmi[i]], matches[rmi[i]+1:]...)
+		if !isException {
+			filteredMatches = append(filteredMatches, c)
 		}
 	}
+	matches = filteredMatches
+
 	if rv.Count {
 		count := len(matches)
 		matches = []types.MatchData{
@@ -603,6 +621,23 @@ func (tx *Transaction) RemoveRuleTargetByID(id int, variable variables.RuleVaria
 	c := ruleVariableParams{
 		Variable: variable,
 		KeyStr:   key,
+	}
+
+	if multiphaseEvaluation && (variable == variables.Args || variable == variables.ArgsNames) {
+		// ARGS and ARGS_NAMES have to be splitted into _GET and _POST
+		switch variable {
+		case variables.Args:
+			c.Variable = variables.ArgsGet
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+			c.Variable = variables.ArgsPost
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+		case variables.ArgsNames:
+			c.Variable = variables.ArgsGetNames
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+			c.Variable = variables.ArgsPostNames
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+		}
+		return
 	}
 	tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
 }
@@ -911,6 +946,7 @@ func (tx *Transaction) ReadRequestBodyFrom(r io.Reader) (*types.Interruption, in
 	}
 
 	if tx.requestBodyBuffer.length == tx.RequestBodyLimit {
+		tx.variables.inboundDataError.Set("1")
 		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
 			return setAndReturnBodyLimitInterruption(tx)
 		}
@@ -1086,7 +1122,6 @@ func (tx *Transaction) WriteResponseBody(b []byte) (*types.Interruption, int, er
 		runProcessResponseBody = false
 	)
 	if tx.responseBodyBuffer.length+writingBytes >= tx.ResponseBodyLimit {
-		// TODO: figure out ErrorData vs DataError: https://github.com/corazawaf/coraza/issues/564
 		tx.variables.outboundDataError.Set("1")
 		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
 			// We interrupt this transaction in case ResponseBodyLimitAction is Reject
@@ -1138,7 +1173,6 @@ func (tx *Transaction) ReadResponseBodyFrom(r io.Reader) (*types.Interruption, i
 	if l, ok := r.(ByteLenger); ok {
 		writingBytes = int64(l.Len())
 		if tx.responseBodyBuffer.length+writingBytes >= tx.ResponseBodyLimit {
-			// TODO: figure out ErrorData vs DataError: https://github.com/corazawaf/coraza/issues/564
 			tx.variables.outboundDataError.Set("1")
 			if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
 				return setAndReturnBodyLimitInterruption(tx)
@@ -1159,6 +1193,7 @@ func (tx *Transaction) ReadResponseBodyFrom(r io.Reader) (*types.Interruption, i
 	}
 
 	if tx.responseBodyBuffer.length == tx.ResponseBodyLimit {
+		tx.variables.outboundDataError.Set("1")
 		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
 			return setAndReturnBodyLimitInterruption(tx)
 		}
@@ -1274,6 +1309,9 @@ func (tx *Transaction) ProcessLogging() {
 	if tx.AuditEngine == types.AuditEngineRelevantOnly && tx.audit {
 		re := tx.WAF.AuditLogRelevantStatus
 		status := tx.variables.responseStatus.Get()
+		if tx.IsInterrupted() {
+			status = strconv.Itoa(tx.interruption.Status)
+		}
 		if re != nil && !re.Match([]byte(status)) {
 			// Not relevant status
 			tx.debugLogger.Debug().
@@ -1345,22 +1383,25 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 		HostIP_:        tx.variables.serverAddr.Get(),
 		HostPort_:      hostPort,
 		ServerID_:      tx.variables.serverName.Get(), // TODO check
+		Request_: &auditlog.TransactionRequest{
+			Method_:   tx.variables.requestMethod.Get(),
+			URI_:      tx.variables.requestURI.Get(),
+			Protocol_: tx.variables.requestProtocol.Get(),
+		},
 	}
 
 	for _, part := range tx.AuditLogParts {
 		switch part {
 		case types.AuditLogPartRequestHeaders:
-			if al.Transaction_.Request_ == nil {
-				al.Transaction_.Request_ = &auditlog.TransactionRequest{}
-			}
 			al.Transaction_.Request_.Headers_ = tx.variables.requestHeaders.Data()
 		case types.AuditLogPartRequestBody:
-			if al.Transaction_.Request_ == nil {
-				al.Transaction_.Request_ = &auditlog.TransactionRequest{}
+			reader, err := tx.requestBodyBuffer.Reader()
+			if err == nil {
+				content, err := io.ReadAll(reader)
+				if err == nil {
+					al.Transaction_.Request_.Body_ = string(content)
+				}
 			}
-			// TODO maybe change to:
-			// al.Transaction.Request.Body = tx.RequestBodyBuffer.String()
-			al.Transaction_.Request_.Body_ = tx.variables.requestBody.Get()
 
 			/*
 			* TODO:
@@ -1450,13 +1491,25 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 // It also allows caches the transaction back into the sync.Pool
 func (tx *Transaction) Close() error {
 	defer tx.WAF.txPool.Put(tx)
-	tx.variables.reset()
+
 	var errs []error
+	if environment.HasAccessToFS {
+		// TODO(jcchavezs): filesTmpNames should probably be a new kind of collection that
+		// is aware of the files and then attempt to delete them when the collection
+		// is resetted or an item is removed.
+		for _, file := range tx.variables.filesTmpNames.Get("") {
+			if err := os.Remove(file); err != nil {
+				errs = append(errs, fmt.Errorf("removing temporary file: %v", err))
+			}
+		}
+	}
+
+	tx.variables.reset()
 	if err := tx.requestBodyBuffer.Reset(); err != nil {
-		errs = append(errs, err)
+		errs = append(errs, fmt.Errorf("reseting request body buffer: %v", err))
 	}
 	if err := tx.responseBodyBuffer.Reset(); err != nil {
-		errs = append(errs, err)
+		errs = append(errs, fmt.Errorf("reseting response body buffer: %v", err))
 	}
 
 	if tx.IsInterrupted() {
@@ -1471,14 +1524,11 @@ func (tx *Transaction) Close() error {
 			Msg("Transaction finished")
 	}
 
-	switch {
-	case len(errs) == 0:
+	if len(errs) == 0 {
 		return nil
-	case len(errs) == 1:
-		return fmt.Errorf("transaction close failed: %s", errs[0].Error())
-	default:
-		return fmt.Errorf("transaction close failed:\n- %s\n- %s", errs[0].Error(), errs[1].Error())
 	}
+
+	return fmt.Errorf("transaction close failed: %v", errors.Join(errs...))
 }
 
 // String will return a string with the transaction debug information
@@ -1667,11 +1717,18 @@ func NewTransactionVariables() *TransactionVariables {
 	// XML is a pointer to RequestXML
 	v.xml = v.requestXML
 
-	v.argsGet = collections.NewNamedCollection(variables.ArgsGet)
+	if shouldUseCaseSensitiveNamedCollection {
+		v.argsGet = collections.NewCaseSensitiveNamedCollection(variables.ArgsGet)
+		v.argsPost = collections.NewCaseSensitiveNamedCollection(variables.ArgsPost)
+		v.argsPath = collections.NewCaseSensitiveNamedCollection(variables.ArgsPath)
+	} else {
+		v.argsGet = collections.NewNamedCollection(variables.ArgsGet)
+		v.argsPost = collections.NewNamedCollection(variables.ArgsPost)
+		v.argsPath = collections.NewNamedCollection(variables.ArgsPath)
+	}
+
 	v.argsGetNames = v.argsGet.Names(variables.ArgsGetNames)
-	v.argsPost = collections.NewNamedCollection(variables.ArgsPost)
 	v.argsPostNames = v.argsPost.Names(variables.ArgsPostNames)
-	v.argsPath = collections.NewNamedCollection(variables.ArgsPath)
 	v.argsCombinedSize = collections.NewSizeCollection(variables.ArgsCombinedSize, v.argsGet, v.argsPost)
 	v.args = collections.NewConcatKeyed(
 		variables.Args,
